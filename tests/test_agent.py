@@ -5,10 +5,12 @@ TestModel は実際のLLMを呼ばない偽モデルで、登録されたツー�
 「ツールが登録され、呼ばれ、結果がモデルに戻るか」を確かめられる。
 """
 
+from pydantic_ai import DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 from pydantic_ai.models.test import TestModel
 
-from app.agent import agent
+from app import tools
+from app.agent import agent, ask_approvals
 
 BASE_TOOLS = {"search_glossary", "get_lecture_summary"}
 
@@ -27,7 +29,9 @@ def test_base_tools_are_registered_and_called():
 
     called = {p.tool_name for p in _parts(result, ToolCallPart)}
     assert BASE_TOOLS <= called
-    assert len(_parts(result, ToolReturnPart)) == len(_parts(result, ToolCallPart))
+    # 承認付きのツール（宿題・実装の save_learning_log）は承認待ちで止まり、結果はまだ返らない
+    pending = result.output.approvals if isinstance(result.output, DeferredToolRequests) else []
+    assert len(_parts(result, ToolReturnPart)) + len(pending) == len(_parts(result, ToolCallPart))
     assert result.output
 
 
@@ -37,3 +41,45 @@ def test_glossary_result_reaches_the_model():
         result = agent.run_sync("RAGとは？")
     returns = _parts(result, ToolReturnPart)
     assert returns and returns[0].tool_name == "search_glossary"
+
+
+# --- 第3回 宿題（実装）: save_learning_log は利用者の承認があったときだけ保存する ---
+
+
+def _ask_to_save(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "LOG_DIR", tmp_path / "learning_log")
+    with agent.override(model=TestModel(call_tools=["save_learning_log"])):
+        return agent.run_sync("今日の学びを記録して")
+
+
+def test_save_learning_log_waits_for_approval(tmp_path, monkeypatch):
+    result = _ask_to_save(tmp_path, monkeypatch)
+
+    assert isinstance(result.output, DeferredToolRequests)
+    assert [c.tool_name for c in result.output.approvals] == ["save_learning_log"]
+    assert not tools.LOG_DIR.exists()  # 承認前には何も保存されない
+
+
+def test_save_learning_log_saves_after_approval(tmp_path, monkeypatch):
+    first = _ask_to_save(tmp_path, monkeypatch)
+    approvals = ask_approvals(first.output, ask=lambda _: "y")
+    with agent.override(model=TestModel(call_tools=["save_learning_log"])):
+        result = agent.run_sync(message_history=first.all_messages(), deferred_tool_results=approvals)
+
+    assert isinstance(result.output, str)
+    assert len(list(tools.LOG_DIR.glob("*.md"))) == 1
+    returns = [p for p in _parts(result, ToolReturnPart) if p.tool_name == "save_learning_log"]
+    assert "保存しました" in returns[0].content
+
+
+def test_save_learning_log_does_nothing_when_denied(tmp_path, monkeypatch):
+    first = _ask_to_save(tmp_path, monkeypatch)
+    denials = ask_approvals(first.output, ask=lambda _: "n")
+    assert all(isinstance(v, ToolDenied) for v in denials.approvals.values())
+    with agent.override(model=TestModel(call_tools=["save_learning_log"])):
+        result = agent.run_sync(message_history=first.all_messages(), deferred_tool_results=denials)
+
+    assert isinstance(result.output, str)
+    assert not tools.LOG_DIR.exists()
+    returns = [p for p in _parts(result, ToolReturnPart) if p.tool_name == "save_learning_log"]
+    assert "許可しませんでした" in returns[0].content
