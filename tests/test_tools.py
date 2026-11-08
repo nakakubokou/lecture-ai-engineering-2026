@@ -53,6 +53,15 @@ def test_make_quiz_reports_lecture_without_terms():
     assert "用語集にありません" in tools.make_quiz(99)
 
 
+def test_save_learning_log_writes_markdown(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "LOG_DIR", tmp_path / "learning_log")
+    message = tools.save_learning_log("LoRAとQLoRA", "QLoRAは量子化してからLoRAで学習する。")
+    files = list(tools.LOG_DIR.glob("*.md"))
+    assert len(files) == 1 and files[0].name in message
+    text = files[0].read_text(encoding="utf-8")
+    assert text.startswith("# LoRAとQLoRA") and "量子化" in text
+
+
 def test_default_question_of_lecture1_is_answerable_from_glossary():
     """第1回の既定の質問（app.ask）は、第3回のエージェントが用語集で正しく答えられること。"""
     from app.ask import DEFAULT_QUESTION
